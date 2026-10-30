@@ -14,6 +14,8 @@ RE_DATE     = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 RE_CODE     = re.compile(r"^\d{3}-\d{3}$")
 RE_CYR_NAME = re.compile(r"^[А-ЯЁ][А-ЯЁ \-]*$")
 
+VALID_ON = date(2026, 10, 1)
+
 def norm(s):
     return " ".join(str(s or "").split()).upper()
 
@@ -27,6 +29,20 @@ def age_at(birth, on):
     y = on.year - birth.year
     if (on.month, on.day) < (birth.month, birth.day): y -= 1
     return y
+
+def add_years(d, n):
+    try: return d.replace(year=d.year + n)
+    except ValueError: return d.replace(year=d.year + n, day=28)
+
+def is_passport_valid(birth, issue):
+    if not birth or not issue or issue <= birth: return False
+    a = age_at(birth, issue)
+    if a < 14: return False
+    if a < 20:
+        return add_years(birth, 20) >= VALID_ON
+    if a < 45:
+        return add_years(birth, 45) >= VALID_ON
+    return True # Бессрочный (выдан в 45+)
 
 def _field_text(field):
     if not field: return ""
@@ -56,6 +72,7 @@ def load_subdivisions(path="reference/subdivisions.csv"):
 def evaluate_doc(doc, subdiv, field_conf_thr=0.0, char_conf_thr=0.0):
     reasons = []
     viz = doc.get("viz") or {}
+    source = doc.get("source", "")
     
     values = {}
     for f in FIELDS:
@@ -70,10 +87,15 @@ def evaluate_doc(doc, subdiv, field_conf_thr=0.0, char_conf_thr=0.0):
             reasons.append(f"conf:{f}")
         if _min_char_conf(field.get("lines")) < char_conf_thr:
             reasons.append(f"char:{f}")
+            
+        # Дополнительная проверка для mobile_v2 (модель завышает уверенность)
+        if source == "mobile_v2" and _conf(field) < 0.99:
+            reasons.append("mobile_v2:low_field_conf")
 
     if len(values) != len(FIELDS):
         return False, values, reasons
 
+    # 1. Format checks
     for f in ("Last_name_ru", "First_name_ru", "Middle_name_ru"):
         if not RE_CYR_NAME.match(norm(values[f])):
             reasons.append(f"fmt:{f}")
@@ -82,25 +104,28 @@ def evaluate_doc(doc, subdiv, field_conf_thr=0.0, char_conf_thr=0.0):
     if sex not in ("М", "МУЖ", "МУЖСКОЙ", "Ж", "ЖЕН", "ЖЕНСКИЙ"):
         reasons.append("fmt:sex")
 
-    fn = norm(values["First_name_ru"])
-    ln = norm(values["Last_name_ru"])
-    mn = norm(values["Middle_name_ru"])
-    if fn.startswith("ЛАВ") or fn.startswith("ЛУВ") or "НР" in ln or "ХБ" in fn or ln.endswith("СОР"):
-        reasons.append("fmt:name_typo")
-    if re.search(r"^Л[БВГДЖЗКЛМНПРСТФХЦЧШЩ]", ln) or re.search(r"^Л[БВГДЖЗКЛМНПРСТФХЦЧШЩ]", fn):
-        reasons.append("fmt:name_consonant")
-    if "СВИЧ" in mn or "ЗВИЧ" in mn:
-        reasons.append("fmt:mn_typo")
+    # 2. Dates & Validity
+    birth = parse_date(values["Birth_date"])
+    issue = parse_date(values["Issue_date"])
+    if not birth or not issue:
+        reasons.append("parse:date")
+    else:
+        if not is_passport_valid(birth, issue):
+            reasons.append("date:expired")
 
+    # 3. Birth Place Checks (Missing line logic)
     bp = norm(values["Birth_place_ru"])
-    org = norm(values["Issue_organization_ru"])
-    if re.search(r'\.[А-ЯЁ]', bp) or re.search(r'\.[А-ЯЁ]', org):
-        reasons.append("fmt:space")
+    bp_field = viz.get("Birth_place_ru") or {}
+    lines_count = len(bp_field.get("lines") or [])
+    
+    # Если адрес слишком короткий или нет ключевых слов региона/района, вероятно, потеряна строка
+    if len(bp) < 20 or ("ОБЛ" not in bp and "КРАЙ" not in bp and "Р-Н" not in bp and "РАЙОН" not in bp and "РЕСП" not in bp):
+        if lines_count <= 1:
+            reasons.append("bp:truncated_or_missing_line")
 
-    if bp.startswith("Р-НА") or len(bp) < 10:
-        reasons.append("fmt:bp_truncated")
-        
+    # 4. Issue Organization Checks
     code = values["Issue_organisation_code"].strip()
+    org = norm(values["Issue_organization_ru"])
     if not RE_CODE.match(code):
         reasons.append("fmt:code")
     elif code in subdiv:
@@ -114,19 +139,10 @@ def evaluate_doc(doc, subdiv, field_conf_thr=0.0, char_conf_thr=0.0):
     else:
         reasons.append("xref:unknown_code")
 
+    # 5. Licence
     lic_digits = re.sub(r"\D", "", values["Licence_number"])
     if len(lic_digits) != 10:
         reasons.append("fmt:licence")
-
-    birth = parse_date(values["Birth_date"])
-    issue = parse_date(values["Issue_date"])
-    if not birth or not issue:
-        reasons.append("parse:date")
-    else:
-        if issue <= birth or age_at(birth, issue) < 14:
-            reasons.append("date:impossible")
-        if birth.year < 1900 or birth.year > 2026 or issue.year < 1900 or issue.year > 2026:
-            reasons.append("date:year_out_of_bounds")
 
     return (not reasons), values, reasons
 
@@ -138,7 +154,7 @@ def main():
     subdiv = load_subdivisions()
     
     T_FIELD = 0.0
-    T_CHAR = 1.0 
+    T_CHAR = 1.0  # Самый безопасный порог
     
     n = n_acc = 0
     with open(inp, encoding="utf-8") as fi, open(outp, "w", encoding="utf-8") as fo:
